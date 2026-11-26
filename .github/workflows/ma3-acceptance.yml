@@ -1,0 +1,89 @@
+name: MA3 sandbox acceptance
+on:
+  push:
+    branches: [orchiva/ci/ma3-hud-20261126]
+
+permissions:
+  contents: read
+  pull-requests: read
+  checks: write
+
+concurrency: ma3-hud-acceptance
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify each approved HUD output against its PR head
+        shell: python
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          import base64
+          import hashlib
+          import json
+          import os
+          import subprocess
+
+          repo = "kopite97/PoC-sandbox"
+          target = "orchiva/integration/ma3-hud-20261126"
+          prefix = "orchiva/feature/ma3-hud-20261126/d1-ma-poc-20261126-001-hud-"
+          check_name = "ma3-approved-output"
+          fixtures = [
+              (2, "A", "rules.txt", "deff5018f22b453312c25ab3245192fdd770564f4da56c281aeee978986c53b9"),
+              (4, "B", "label.txt", "e0eaf36252b821a11646c96f93ea40277423c3053c86d31915444f0b5ae0ea46"),
+              (6, "C", "score.cjs", "e1165c989f50f15ba1780cbbdceabdd7f8fa5e0ebe9f6b9bccd8e2fa175b65ab"),
+              (8, "D", "hud.cjs", "efa117f4e66d53bae6f5ea79b5e6403cc577b062b38ea7b20fd7d131bd2bfacf"),
+              (10, "E", "qa.txt", "6d81108e534d4dd0ff73464a5e4181d61127d3a87cac6108390fda0887a563b0"),
+          ]
+
+          def api(path, method="GET", data=None):
+              args = ["gh", "api", "--method", method, "repos/" + repo + "/" + path]
+              if data is not None:
+                  args += ["--input", "-"]
+              return json.loads(subprocess.check_output(args, input=json.dumps(data) if data else None, text=True))
+
+          failures = []
+          for number, feature, filename, approved_hash in fixtures:
+              pr_path = f"pulls/{number}"
+              pr = api(pr_path)
+              if pr["state"] != "open":
+                  continue
+              if (pr["head"]["repo"]["full_name"] != repo or pr["head"]["ref"] != prefix + feature
+                      or pr["base"]["repo"]["full_name"] != repo or pr["base"]["ref"] != target):
+                  raise RuntimeError(f"Unexpected branch on PR #{number}")
+              head = pr["head"]["sha"]
+              changes = api(pr_path + "/files?per_page=100")
+              tree = api(f"git/trees/{head}?recursive=1")
+              files = [f for f in tree["tree"] if f["path"] == filename and f["type"] == "blob" and f["mode"] == "100644"]
+              passed = (not tree["truncated"] and pr["changed_files"] == len(changes) == len(files) == 1
+                        and changes[0]["filename"] == filename and changes[0]["status"] == "added"
+                        and changes[0]["sha"] == files[0]["sha"])
+              if passed:
+                  blob = api("git/blobs/" + files[0]["sha"])
+                  passed = hashlib.sha256(base64.b64decode(blob["content"])).hexdigest() == approved_hash
+              if api(pr_path)["head"]["sha"] != head:
+                  raise RuntimeError(f"PR #{number} changed during verification")
+              conclusion = "success" if passed else "failure"
+              print(f"PR #{number} {head} {filename} {conclusion}", flush=True)
+              if not passed:
+                  failures.append(number)
+              if os.environ.get("GITHUB_ACTIONS") != "true":
+                  continue
+              key = f"ma3-hud-20261126/{number}/{head}"
+              payload = {
+                  "status": "completed", "conclusion": conclusion,
+                  "details_url": f"https://github.com/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+                  "output": {"title": f"Feature {feature} · {filename}", "summary": f"Compared the PR diff and blob SHA-256 to the approved MA2 output. Result: {conclusion}."},
+              }
+              runs = api(f"commits/{head}/check-runs?check_name={check_name}&filter=all&per_page=100")
+              own = [r for r in runs["check_runs"] if r["external_id"] == key and r["app"]["slug"] == "github-actions"]
+              if len(own) > 1 or runs["total_count"] != len(runs["check_runs"]):
+                  raise RuntimeError("Ambiguous check history")
+              if own:
+                  api(f"check-runs/{own[0]['id']}", "PATCH", payload)
+              else:
+                  api("check-runs", "POST", dict(payload, name=check_name, head_sha=head, external_id=key))
+          if failures:
+              raise RuntimeError(f"Failed PRs: {failures}")
